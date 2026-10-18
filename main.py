@@ -1,23 +1,27 @@
 import os
 import asyncio
-import base64
-import json
 import aiohttp
-import uuid
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения (из настроек хостинга)
-load_dotenv()
+# ==========================================
+#       СЮДА ВСТАВЛЯЕМ НАШИ ТАЙНЫЕ КЛЮЧИ    
+# ==========================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CLIENT_ID = os.getenv("SBER_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SBER_CLIENT_SECRET")
+# 1. Токен от BotFather (тот самый 88409...)
+BOT_TOKEN = "8840934718:AAHQBUWtrHnlRKy7Tj0U3to89eXCbGXgBco"
+# 2. Authorization Key из Сбера (тот самый длинный MD...)
+# ВАЖНО: Удали пробелы перед и после кавычек!
+AUTH_KEY_SBER = "MDFhMTRmMzMtZTFlNC03ZDc2LTlmNWEtNmRlMTUwMDljNjBmOjlmNThkMTMxLTNhYzYtNGEyOS04N2E4LWY0Y2IxOGQ1MGE4MQ==" 
 
-if not all([BOT_TOKEN, CLIENT_ID, CLIENT_SECRET]):
-    raise ValueError("Не заданы BOT_TOKEN, SBER_CLIENT_ID или SBER_CLIENT_SECRET в настройках!")
+# ==========================================
+
+if not BOT_TOKEN or "тут_токен" in BOT_TOKEN:
+    raise ValueError("❌ Ошибка: Не задан BOT_TOKEN!")
+
+if not AUTH_KEY_SBER or "ВСТАВЬ" in AUTH_KEY_SBER:
+    raise ValueError("❌ Ошибка: Ты забыл вставить Authorization Key от Сбера!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -25,112 +29,115 @@ dp = Dispatcher()
 access_token = None
 token_expiry = None
 
-# Функция получения токена доступа к API Сбера
 async def get_sber_access_token():
     global access_token, token_expiry
+    
+    # Если токен еще жив, возвращаем его
     if access_token and token_expiry > datetime.now():
         return access_token
     
-    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
-    auth_bytes = base64.b64encode(credentials.encode()).decode('ascii')
-    
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
-        'Authorization': f'Basic {auth_bytes}',
-        'RqUID': str(uuid.uuid4()),
+        'Authorization': f'Basic {AUTH_KEY_SBER}', # Используем готовый ключ
         'Content-Type': 'application/x-www-form-urlencoded'
     }
     data = {'scope': 'GIGACHAT_API_PERS'}
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            # ВАЖНО: ssl=False игнорирует проверку сертификатов Сбербанка. 
-            # Для продакшена лучше скачать их сертификат, но для быстрого старта это работает.
+    try:
+        async with aiohttp.ClientSession() as session:
+            # ssl=False игнорирует проверку сертификатов (важно для некоторых сетей РФ)
             async with session.post(url, headers=headers, data=data, ssl=False) as resp:
                 if resp.status == 200:
                     res_json = await resp.json()
                     access_token = res_json['access_token']
-                    # Токен живёт обычно час, ставим запас 5 минут
                     token_expiry = datetime.now() + timedelta(minutes=55) 
-                    print("Successfully got new Sber Access Token")
+                    print("✅ GigaChat Auth Success")
                     return access_token
                 else:
-                    print(f"Error getting token: {resp.status}, {await resp.text()}")
+                    err_text = await resp.text()
+                    print(f"❌ Auth Error: {resp.status} - {err_text}")
                     return None
-        except Exception as e:
-            print(f"Exception during token request: {e}")
-            return None
+    except Exception as e:
+        print(f"❌ Exception during auth: {e}")
+        return None
 
 SYSTEM_PROMPT = """
-Ты - строгий модератор чата. Проанализируй сообщение пользователя.
-Категории нарушений:
-1. SPAM (флуд, капс, бессмыслица, повторяющиеся символы)
-2. ADVERT (реклама других каналов, ссылки, продажа чего-либо, приглашения в другие группы)
-3. INSULT (оскорбления, мат, агрессия, угрозы)
-4. OK (обычное общение по теме, вопросы, реакции)
+Ты - ИИ-модератор Telegram. Анализировать сообщения строго.
+Категории:
+SPAM (флуд, капс, мусор, пустые символы, спам-стикеры)
+ADVERT (реклама каналов, ссылки t.me/vk/youtube, продажа товаров, приглашения)
+INSULT (оскорбления, мат, агрессия, угрозы, токсичность)
+OK (нормальное общение, вопросы, эмоции, юмор без оскорблений)
 
-Ответь ТОЛЬКО одним словом категории. Например: ADVERT
+Ответь ТОЛЬКО одним словом категории. Без знаков препинания.
 """
 
-async def check_message(text: str) -> str:
+async def check_message_ai(text: str) -> str:
     token = await get_sber_access_token()
     if not token:
-        return "OK" # Если нет связи с AI, пропускаем, чтобы не банить всех подряд
+        return "OK" 
         
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json'
-    }
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     payload = {
         "model": "GigaChat",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text}
-        ],
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}],
         "temperature": 0.1
     }
     
-    async with aiohttp.ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, ssl=False) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    answer = data['choices'][0]['message']['content'].strip().upper()
-                    return answer
-                else:
-                    print(f"GigaChat Error: {resp.status}")
+                    ans = data['choices'][0]['message']['content'].strip().upper()
+                    clean_ans = "".join(c for c in ans if c.isalpha())
+                    
+                    if clean_ans in ["SPAM", "ADVERT", "INSULT", "OK"]:
+                        return clean_ans
+                    
+                    # Fallback logic
+                    if "СПАМ" in ans or "ФЛУД" in ans: return "SPAM"
+                    if "РЕКЛАМА" in ans or "ССЫЛКА" in ans: return "ADVERT"
+                    if "ОСКОРБЛЕНИЕ" in ans or "МАТ" in ans: return "INSULT"
                     return "OK"
-        except Exception as e:
-            print(e)
-            return "OK"
+                else:
+                    print(f"GigaChat Err: {resp.status}")
+                    return "OK"
+    except Exception as e:
+        print(e)
+        return "OK"
 
 @dp.message()
 async def handle_msg(message: types.Message):
-    # Работаем только в группах (чатах обсуждений)
     if message.chat.type not in ["group", "supergroup"]:
         return
-    
     if not message.text:
         return
         
     user_id = message.from_user.id
     chat_id = message.chat.id
+    text_lower = message.text.lower()
     
-    # Быстрая проверка на ссылки до обращения к AI (экономия ресурсов)
-    if any(x in message.text.lower() for x in ['t.me/', 'wa.me/', 'vk.com/']):
-        verdict = "ADVERT"
+    # Быстрые фильтры (без AI)
+    banned_domains = ['t.me/', 'wa.me/', 'vk.com/', 'youtube.com', 'boosty.to', 'discord.gg']
+    if any(d in text_lower for d in banned_domains):
+         verdict = "ADVERT"
+    elif len(message.text.strip()) <= 2: # Очень короткие сообщения часто спам
+         verdict = "SPAM"
     else:
-        verdict = await check_message(message.text)
-        
+         # Тяжелая артиллерия - AI
+         verdict = await check_message_ai(message.text)
+             
     if verdict != "OK":
         try:
             await bot.delete_message(chat_id, message.message_id)
-            print(f"Banned/Deleted msg from {user_id}. Reason: {verdict}")
+            print(f"[{verdict}] Deleted from @{message.from_user.username}: '{text_lower[:30]}...'")
         except Exception as e:
             print(f"Delete error: {e}")
 
 async def main():
+    print("🤖 Starting PRO AI Moderator...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
